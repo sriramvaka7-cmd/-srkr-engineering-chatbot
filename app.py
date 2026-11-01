@@ -11,12 +11,13 @@ import gradio as gr
 
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
+
 from sentence_transformers import SentenceTransformer, util
 
 
-# ------------------------------------------
-# 1. Project file paths
-# ------------------------------------------
+# =====================================================
+# 1. PROJECT FILE PATHS
+# =====================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -26,101 +27,165 @@ TOKENIZER_PATH = BASE_DIR / "tokenizer.pickle"
 ENCODER_PATH = BASE_DIR / "label_encoder.pickle"
 
 
-# ------------------------------------------
-# 2. Load chatbot files
-# ------------------------------------------
+# =====================================================
+# 2. LOAD DATASET AND TRAINED MODEL
+# =====================================================
 
-print("Loading SRKR chatbot files...")
+print("Loading SRKR Engineering College Chatbot...")
 
+# Check that all required files exist
+required_files = [
+    DATASET_PATH,
+    MODEL_PATH,
+    TOKENIZER_PATH,
+    ENCODER_PATH
+]
+
+for file_path in required_files:
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"Required project file not found: {file_path.name}"
+        )
+
+# Load JSON dataset
 with open(DATASET_PATH, "r", encoding="utf-8") as f:
     dataset_json = json.load(f)
 
+# Load tokenizer
 with open(TOKENIZER_PATH, "rb") as f:
     tokenizer = pickle.load(f)
 
+# Load label encoder
 with open(ENCODER_PATH, "rb") as f:
     label_encoder = pickle.load(f)
 
+# Load trained LSTM model
 model = load_model(MODEL_PATH, compile=False)
 
-# Get sequence length directly from trained model
+# Get sequence length from the trained model
 max_len = int(model.input_shape[-1])
 
-# Load knowledge base
-kb_records = dataset_json.get("knowledge_base", [])
+print("Dataset loaded successfully!")
+print("LSTM model loaded successfully!")
+print("Tokenizer loaded successfully!")
+print("Label encoder loaded successfully!")
 
-if not kb_records:
-    raise ValueError("Knowledge base is empty.")
 
-# ------------------------------------------
-# 3. Text preprocessing
-# ------------------------------------------
+# =====================================================
+# 3. TEXT PREPROCESSING
+# =====================================================
 
 def preprocess_text(text):
+
     if not text:
         return ""
 
+    # Convert to lowercase
     text = text.lower().strip()
+
+    # Remove special characters
     text = re.sub(r"[^a-zA-Z0-9\s]", " ", text)
+
+    # Normalize whitespace
     text = re.sub(r"\s+", " ", text).strip()
 
     return text
 
 
-# ------------------------------------------
-# 4. Initialize semantic retrieval
-# ------------------------------------------
+# =====================================================
+# 4. LOAD KNOWLEDGE BASE
+# =====================================================
 
-print("Loading Sentence Transformer...")
+kb_records = dataset_json.get("knowledge_base", [])
 
-retrieval_model = SentenceTransformer("all-MiniLM-L6-v2")
+if not kb_records:
+    raise ValueError(
+        "No knowledge-base records found in the JSON dataset."
+    )
 
+print(f"Knowledge base records loaded: {len(kb_records)}")
+
+# Prepare knowledge-base passages
 kb_passages = []
 
 for item in kb_records:
+
     passage = (
         f"{item.get('title', '')} "
         f"({item.get('category', '')}): "
         f"{item.get('answer', '')}"
     )
+
     kb_passages.append(passage)
 
+
+# =====================================================
+# 5. LOAD SENTENCE TRANSFORMER
+# =====================================================
+
+print("Loading Sentence Transformer model...")
+
+retrieval_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# Generate knowledge-base embeddings
 kb_embeddings = retrieval_model.encode(
     kb_passages,
     convert_to_tensor=True
 )
 
-print("SRKR chatbot loaded successfully!")
+print("Semantic retrieval initialized successfully!")
 
 
-# ------------------------------------------
-# 5. Chatbot response function
-# ------------------------------------------
+# =====================================================
+# 6. CHATBOT RESPONSE FUNCTION
+# =====================================================
 
 def get_bot_response(user_query):
 
     if not user_query or not user_query.strip():
-        return "Please enter a valid question.", "Empty Query", 0.0, None
+
+        return (
+            "Please enter a valid question.",
+            "Empty Query",
+            0.0,
+            None
+        )
+
+    # -----------------------------------------------
+    # Text preprocessing
+    # -----------------------------------------------
 
     cleaned = preprocess_text(user_query)
 
+    # Convert text into sequences
     seq = tokenizer.texts_to_sequences([cleaned])
 
+    # Pad sequences
     padded = pad_sequences(
         seq,
         maxlen=max_len,
         padding="post"
     )
 
+    # -----------------------------------------------
     # LSTM intent classification
-    pred = model.predict(padded, verbose=0)[0]
+    # -----------------------------------------------
+
+    pred = model.predict(
+        padded,
+        verbose=0
+    )[0]
 
     max_idx = int(np.argmax(pred))
+
     confidence = float(pred[max_idx])
 
     predicted_tag = label_encoder.classes_[max_idx]
 
+    # -----------------------------------------------
     # Semantic retrieval
+    # -----------------------------------------------
+
     query_embedding = retrieval_model.encode(
         user_query,
         convert_to_tensor=True
@@ -131,32 +196,57 @@ def get_bot_response(user_query):
         kb_embeddings
     )[0]
 
-    best_match_idx = int(tf.argmax(cos_scores).numpy())
-    best_score = float(cos_scores[best_match_idx].numpy())
+    # Correct PyTorch tensor conversion
+    best_match_idx = int(
+        cos_scores.argmax().item()
+    )
 
+    best_score = float(
+        cos_scores[best_match_idx].item()
+    )
+
+    # -----------------------------------------------
     # Fallback response
+    # -----------------------------------------------
+
     if confidence < 0.25 and best_score < 0.30:
 
         fallback_answer = (
-            "I'm sorry, I cannot find an exact answer to your "
-            "query in our SRKR records. Please visit the official "
-            "college website: https://www.srkrec.ac.in"
+            "I'm sorry, I cannot find an exact answer "
+            "to your query in our SRKR records. "
+            "Could you please specify your question, "
+            "or visit the official college website "
+            "at https://www.srkrec.ac.in for details?"
         )
 
-        return fallback_answer, "Fallback / Unknown", confidence, None
+        return (
+            fallback_answer,
+            "Fallback / Unknown",
+            confidence,
+            None
+        )
 
-    # Retrieve matching answer
+    # -----------------------------------------------
+    # Retrieve matching knowledge-base record
+    # -----------------------------------------------
+
     matched_kb = kb_records[best_match_idx]
 
     answer = matched_kb.get("answer", "")
+
     sources = matched_kb.get("source_urls", [])
 
-    return answer, predicted_tag, confidence, sources
+    return (
+        answer,
+        predicted_tag,
+        confidence,
+        sources
+    )
 
 
-# ------------------------------------------
-# 6. Gradio chatbot interface
-# ------------------------------------------
+# =====================================================
+# 7. GRADIO CHAT WRAPPER
+# =====================================================
 
 def chat_wrapper(message, history):
 
@@ -164,14 +254,22 @@ def chat_wrapper(message, history):
 
     formatted_response = str(ans)
 
+    # Add official source links
     if sources:
+
         formatted_response += (
             "\n\n**Official Sources:**\n"
-            + "\n".join([f"- [{s}]({s})" for s in sources])
+            + "\n".join(
+                [f"- [{s}]({s})" for s in sources]
+            )
         )
 
     return formatted_response
 
+
+# =====================================================
+# 8. CUSTOM THEME AND CSS
+# =====================================================
 
 custom_theme = gr.themes.Soft(
     primary_hue="blue",
@@ -207,6 +305,10 @@ custom_css = """
 """
 
 
+# =====================================================
+# 9. CREATE GRADIO INTERFACE
+# =====================================================
+
 with gr.Blocks(
     theme=custom_theme,
     css=custom_css
@@ -215,6 +317,7 @@ with gr.Blocks(
     gr.HTML("""
     <div class='header-box'>
         <h1>SRKR Engineering College Chatbot</h1>
+
         <p>
         AI-Powered College Information Assistant
         (LSTM & Semantic Retrieval)
@@ -222,8 +325,9 @@ with gr.Blocks(
     </div>
     """)
 
-    gr.ChatInterface(
+    chatbot = gr.ChatInterface(
         fn=chat_wrapper,
+
         examples=[
             "What courses are offered at SRKR?",
             "What are the admission procedures?",
@@ -236,13 +340,15 @@ with gr.Blocks(
     )
 
 
-# ------------------------------------------
-# 7. Launch web application
-# ------------------------------------------
+# =====================================================
+# 10. LAUNCH WEB APPLICATION
+# =====================================================
 
 if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 7860))
+
+    print("Starting SRKR Engineering College Chatbot...")
 
     demo.launch(
         server_name="0.0.0.0",
